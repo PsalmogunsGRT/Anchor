@@ -1,0 +1,16 @@
+#!/bin/bash
+# Run from the unzipped task folder (the one containing task.toml). Needs docker and npm.
+set -euo pipefail
+test -f task.toml || { echo "run from the task root"; exit 1; }
+( cd environment/app && npm install --no-audit --no-fund && npm ci --no-audit --no-fund )
+cp environment/app/package-lock.json tests/project/package-lock.json
+rm -rf environment/app/node_modules
+DIGEST=$(docker buildx imagetools inspect mcr.microsoft.com/playwright:v1.48.2-jammy --format '{{json .Manifest.Digest}}' | tr -d '"')
+case "$DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "bad digest: $DIGEST"; exit 1;; esac
+sed -i "s|sha256:REPLACE_WITH_PINNED_DIGEST|${DIGEST}|" environment/Dockerfile tests/Dockerfile
+sed -i 's|COPY app/package.json /app/package.json|COPY app/package.json app/package-lock.json /app/|; s|npm install --no-audit --no-fund|npm ci --no-audit --no-fund|' environment/Dockerfile
+sed -i 's|COPY project/package.json /verify/package.json|COPY project/package.json project/package-lock.json /verify/|; s|npm install --no-audit --no-fund|npm ci --no-audit --no-fund|' tests/Dockerfile
+grep -q REPLACE environment/Dockerfile tests/Dockerfile && { echo "placeholder remains"; exit 1; }
+docker build -t grid-agent environment && docker build -t grid-verifier tests
+rm -f ../anchored-virtual-grid-final.zip && zip -qr ../anchored-virtual-grid-final.zip .
+echo "OK: built both images and wrote ../anchored-virtual-grid-final.zip"
