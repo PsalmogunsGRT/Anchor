@@ -1,16 +1,110 @@
-#!/bin/bash
-# Run from the unzipped task folder (the one containing task.toml). Needs docker and npm.
-set -euo pipefail
-test -f task.toml || { echo "run from the task root"; exit 1; }
-( cd environment/app && npm install --no-audit --no-fund && npm ci --no-audit --no-fund )
-cp environment/app/package-lock.json tests/project/package-lock.json
-rm -rf environment/app/node_modules
-DIGEST=$(docker buildx imagetools inspect mcr.microsoft.com/playwright:v1.48.2-jammy --format '{{json .Manifest.Digest}}' | tr -d '"')
-case "$DIGEST" in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "bad digest: $DIGEST"; exit 1;; esac
-sed -i "s|sha256:REPLACE_WITH_PINNED_DIGEST|${DIGEST}|" environment/Dockerfile tests/Dockerfile
-sed -i 's|COPY app/package.json /app/package.json|COPY app/package.json app/package-lock.json /app/|; s|npm install --no-audit --no-fund|npm ci --no-audit --no-fund|' environment/Dockerfile
-sed -i 's|COPY project/package.json /verify/package.json|COPY project/package.json project/package-lock.json /verify/|; s|npm install --no-audit --no-fund|npm ci --no-audit --no-fund|' tests/Dockerfile
-grep -q REPLACE environment/Dockerfile tests/Dockerfile && { echo "placeholder remains"; exit 1; }
-docker build -t grid-agent environment && docker build -t grid-verifier tests
-rm -f ../anchored-virtual-grid-final.zip && zip -qr ../anchored-virtual-grid-final.zip .
-echo "OK: built both images and wrote ../anchored-virtual-grid-final.zip"
+name: finalize-and-verify
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - anchored-virtual-grid.zip
+      - .github/workflows/finalize.yml
+
+jobs:
+  finalize:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    env:
+      BASE_TAG: mcr.microsoft.com/playwright:v1.48.2-jammy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack task
+        run: |
+          set -euo pipefail
+          rm -rf task out logs
+          mkdir -p task out logs
+          unzip -q anchored-virtual-grid.zip -d task
+          test -f task/task.toml
+          test -f task/instruction.md
+
+      - name: Resolve base image digest
+        id: digest
+        run: |
+          set -euo pipefail
+          docker pull "$BASE_TAG" > /dev/null
+          D=$(docker buildx imagetools inspect "$BASE_TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          if ! [[ "$D" =~ ^sha256:[0-9a-f]{64}$ ]]; then echo "unexpected digest: $D"; exit 1; fi
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+          echo "Base image digest: $D" | tee logs/digest.txt
+
+      - name: Generate package-lock.json inside the pinned image
+        run: |
+          set -euo pipefail
+          IMG="${BASE_TAG}@${{ steps.digest.outputs.digest }}"
+          docker run --rm -v "$PWD/task/environment/app:/w" -w /w "$IMG" \
+            npm install --package-lock-only --no-audit --no-fund
+          sudo chown -R "$(id -u):$(id -g)" task
+          test -s task/environment/app/package-lock.json
+          cp task/environment/app/package-lock.json task/tests/project/package-lock.json
+          cmp task/environment/app/package.json task/tests/project/package.json
+
+      - name: Rewrite Dockerfiles (digest, lockfile, npm ci)
+        run: |
+          set -euo pipefail
+          D="${{ steps.digest.outputs.digest }}"
+          sed -i "s|sha256:REPLACE_WITH_PINNED_DIGEST|${D}|" task/environment/Dockerfile task/tests/Dockerfile
+          sed -i 's|COPY app/package.json /app/package.json|COPY app/package.json app/package-lock.json /app/|; s|npm install --no-audit --no-fund|npm ci --no-audit --no-fund|' task/environment/Dockerfile
+          sed -i 's|COPY project/package.json /verify/package.json|COPY project/package.json project/package-lock.json /verify/|; s|npm install --no-audit --no-fund|npm ci --no-audit --no-fund|' task/tests/Dockerfile
+          if grep -q REPLACE_WITH task/environment/Dockerfile task/tests/Dockerfile; then echo "placeholder remains"; exit 1; fi
+          head -1 task/environment/Dockerfile | grep -q harbor-canary
+          head -1 task/tests/Dockerfile | grep -q harbor-canary
+          cat task/environment/Dockerfile task/tests/Dockerfile | tee logs/dockerfiles.txt
+          (cd task && zip -qr ../out/anchored-virtual-grid-final.zip .)
+
+      - name: Build agent and verifier images
+        run: |
+          set -euo pipefail
+          docker build -t grid-agent task/environment 2>&1 | tee logs/build-agent.txt
+          docker build -t grid-verifier task/tests 2>&1 | tee logs/build-verifier.txt
+
+      - name: Oracle run (solve.sh must lead to reward 1)
+        run: |
+          set -uo pipefail
+          docker rm -f agent > /dev/null 2>&1 || true
+          docker run -d --name agent -v "$PWD/task/solution:/solution:ro" grid-agent sleep 3600 > /dev/null
+          docker exec agent bash /solution/solve.sh
+          mkdir -p out/oracle-grid
+          docker cp agent:/app/src/grid/. out/oracle-grid/
+          docker exec -w /app agent npx tsc --noEmit > logs/oracle-tsc.txt 2>&1 || echo "tsc reported issues (non-blocking)"
+          docker exec -w /app agent npm run build > logs/oracle-build.txt 2>&1 || { cat logs/oracle-build.txt; exit 1; }
+          mkdir -p logs/oracle
+          docker run --rm --ipc=host \
+            -v "$PWD/task/tests:/tests:ro" -v "$PWD/out/oracle-grid:/app/src/grid:ro" -v "$PWD/logs/oracle:/logs/verifier" \
+            grid-verifier bash /tests/test.sh > logs/oracle-stdout.txt 2>&1 || true
+          tail -60 logs/oracle-stdout.txt
+          R=$(cat logs/oracle/reward.txt)
+          echo "ORACLE_REWARD=$R" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$R" = "1" ] || [ "$R" = "1.0" ]
+
+      - name: Nop run (empty agent must score 0)
+        run: |
+          set -uo pipefail
+          docker rm -f nop > /dev/null 2>&1 || true
+          docker create --name nop grid-agent > /dev/null
+          mkdir -p out/nop-grid logs/nop
+          docker cp nop:/app/src/grid/. out/nop-grid/
+          docker run --rm --ipc=host \
+            -v "$PWD/task/tests:/tests:ro" -v "$PWD/out/nop-grid:/app/src/grid:ro" -v "$PWD/logs/nop:/logs/verifier" \
+            grid-verifier bash /tests/test.sh > logs/nop-stdout.txt 2>&1 || true
+          tail -30 logs/nop-stdout.txt
+          R=$(cat logs/nop/reward.txt)
+          echo "NOP_REWARD=$R" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$R" = "0" ] || [ "$R" = "0.0" ]
+
+      - name: Upload finished ZIP and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finalized-task-and-logs
+          path: |
+            out/anchored-virtual-grid-final.zip
+            logs/
+          if-no-files-found: warn
