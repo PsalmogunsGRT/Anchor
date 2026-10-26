@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - anchored-virtual-grid.zip
+      - '*.zip'
       - .github/workflows/finalize.yml
 
 jobs:
@@ -21,9 +21,26 @@ jobs:
           set -euo pipefail
           rm -rf task out logs
           mkdir -p task out logs
-          unzip -q anchored-virtual-grid.zip -d task
+          echo "Files in the repository:"
+          find . -path ./.git -prune -o -type f -print | head -50
+          Z=$(find . -path ./.git -prune -o -maxdepth 3 -type f -iname '*.zip' -print | head -n 1)
+          if [ -z "$Z" ]; then
+            echo "ERROR: no .zip file found in the repository. Upload the task ZIP (do not unzip it) with Add file > Upload files."
+            exit 1
+          fi
+          echo "Using ZIP: $Z"
+          unzip -q "$Z" -d task
+          if [ ! -f task/task.toml ]; then
+            T=$(find task -maxdepth 2 -name task.toml | head -n 1)
+            if [ -z "$T" ]; then echo "ERROR: task.toml not found inside the ZIP"; exit 1; fi
+            D=$(dirname "$T")
+            mv "$D" task_inner
+            rm -rf task
+            mv task_inner task
+          fi
           test -f task/task.toml
           test -f task/instruction.md
+          ls task
 
       - name: Resolve base image digest
         id: digest
