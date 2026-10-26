@@ -62,6 +62,10 @@ jobs:
           test -s task/environment/app/package-lock.json
           cp task/environment/app/package-lock.json task/tests/project/package-lock.json
           cmp task/environment/app/package.json task/tests/project/package.json
+          cmp task/environment/app/src/App.tsx task/tests/project/src/App.tsx
+          cmp task/environment/app/src/main.tsx task/tests/project/src/main.tsx
+          cmp task/environment/app/src/data.ts task/tests/project/src/data.ts
+          cmp task/tests/project/src/data.ts task/tests/e2e/data.ts
 
       - name: Rewrite Dockerfiles (digest, lockfile, npm ci)
         run: |
@@ -86,14 +90,14 @@ jobs:
         run: |
           set -uo pipefail
           docker rm -f agent > /dev/null 2>&1 || true
-          docker run -d --name agent -v "$PWD/task/solution:/solution:ro" grid-agent sleep 3600 > /dev/null
+          docker run -d --cpus=4 --memory=4g --memory-swap=4g --name agent -v "$PWD/task/solution:/solution:ro" grid-agent sleep 3600 > /dev/null
           docker exec agent bash /solution/solve.sh
           mkdir -p out/oracle-grid
           docker cp agent:/app/src/grid/. out/oracle-grid/
           docker exec -w /app agent npx tsc --noEmit > logs/oracle-tsc.txt 2>&1 || echo "tsc reported issues (non-blocking)"
           docker exec -w /app agent npm run build > logs/oracle-build.txt 2>&1 || { cat logs/oracle-build.txt; exit 1; }
           mkdir -p logs/oracle
-          docker run --rm --ipc=host \
+          docker run --rm --cpus=4 --memory=4g --memory-swap=4g \
             -v "$PWD/out/oracle-grid:/app/src/grid:ro" -v "$PWD/logs/oracle:/logs/verifier" \
             grid-verifier bash /tests/test.sh > logs/oracle-stdout.txt 2>&1 || true
           tail -60 logs/oracle-stdout.txt
@@ -108,7 +112,7 @@ jobs:
           docker create --name nop grid-agent > /dev/null
           mkdir -p out/nop-grid logs/nop
           docker cp nop:/app/src/grid/. out/nop-grid/
-          docker run --rm --ipc=host \
+          docker run --rm --cpus=4 --memory=4g --memory-swap=4g \
             -v "$PWD/out/nop-grid:/app/src/grid:ro" -v "$PWD/logs/nop:/logs/verifier" \
             grid-verifier bash /tests/test.sh > logs/nop-stdout.txt 2>&1 || true
           tail -30 logs/nop-stdout.txt
@@ -122,7 +126,7 @@ jobs:
           run_v() {
             name="$1"; grid="$2"
             mkdir -p "logs/$name"
-            docker run --rm --ipc=host \
+            docker run --rm --cpus=4 --memory=4g --memory-swap=4g \
               -v "$PWD/$grid:/app/src/grid:ro" -v "$PWD/logs/$name:/logs/verifier" \
               grid-verifier bash /tests/test.sh > "logs/$name-stdout.txt" 2>&1 || true
             cat "logs/$name/reward.txt"
