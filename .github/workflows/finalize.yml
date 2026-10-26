@@ -94,7 +94,7 @@ jobs:
           docker exec -w /app agent npm run build > logs/oracle-build.txt 2>&1 || { cat logs/oracle-build.txt; exit 1; }
           mkdir -p logs/oracle
           docker run --rm --ipc=host \
-            -v "$PWD/task/tests:/tests:ro" -v "$PWD/out/oracle-grid:/app/src/grid:ro" -v "$PWD/logs/oracle:/logs/verifier" \
+            -v "$PWD/out/oracle-grid:/app/src/grid:ro" -v "$PWD/logs/oracle:/logs/verifier" \
             grid-verifier bash /tests/test.sh > logs/oracle-stdout.txt 2>&1 || true
           tail -60 logs/oracle-stdout.txt
           R=$(cat logs/oracle/reward.txt)
@@ -109,12 +109,41 @@ jobs:
           mkdir -p out/nop-grid logs/nop
           docker cp nop:/app/src/grid/. out/nop-grid/
           docker run --rm --ipc=host \
-            -v "$PWD/task/tests:/tests:ro" -v "$PWD/out/nop-grid:/app/src/grid:ro" -v "$PWD/logs/nop:/logs/verifier" \
+            -v "$PWD/out/nop-grid:/app/src/grid:ro" -v "$PWD/logs/nop:/logs/verifier" \
             grid-verifier bash /tests/test.sh > logs/nop-stdout.txt 2>&1 || true
           tail -30 logs/nop-stdout.txt
           R=$(cat logs/nop/reward.txt)
           echo "NOP_REWARD=$R" | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$R" = "0" ] || [ "$R" = "0.0" ]
+
+      - name: Negative controls (these must all score 0)
+        run: |
+          set -uo pipefail
+          run_v() {
+            name="$1"; grid="$2"
+            mkdir -p "logs/$name"
+            docker run --rm --ipc=host \
+              -v "$PWD/$grid:/app/src/grid:ro" -v "$PWD/logs/$name:/logs/verifier" \
+              grid-verifier bash /tests/test.sh > "logs/$name-stdout.txt" 2>&1 || true
+            cat "logs/$name/reward.txt"
+          }
+          rm -rf out/mut-leak out/mut-nof2 out/mut-ties
+          cp -r out/oracle-grid out/mut-leak
+          printf "import t from '../../../tests/e2e/grid.spec.ts?raw';\nexport const leak = t;\n" > out/mut-leak/leak.ts
+          echo "export { leak } from './leak';" >> out/mut-leak/index.ts
+          cp -r out/oracle-grid out/mut-nof2
+          sed -i "/case 'F2':/d" out/mut-nof2/DataGrid.tsx
+          cp -r out/oracle-grid out/mut-ties
+          sed -i 's/x > y ? d : a - b;/x > y ? d : b - a;/' out/mut-ties/DataGrid.tsx
+          grep -q "b - a;" out/mut-ties/DataGrid.tsx
+          FAIL=0
+          for m in leak nof2 ties; do
+            R=$(run_v "mut-$m" "out/mut-$m")
+            echo "MUTANT_${m}_REWARD=$R" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ "$R" != "0" ]; then FAIL=1; fi
+          done
+          grep -i -m3 "outside the grid\|not allowed" logs/mut-leak/playwright.log || true
+          exit $FAIL
 
       - name: Upload finished ZIP and logs
         if: always()
